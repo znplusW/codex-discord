@@ -24,6 +24,10 @@ export async function execute(
     });
     return;
   }
+  if (project.fixed_session) {
+    await interaction.editReply({ content: "此频道固定绑定 Codex 会话。退出连接用 /exit，归档用 /archive，删除两端用 /delete。" });
+    return;
+  }
 
   await sessionManager.stopSession(channelId);
   unregisterProject(channelId);

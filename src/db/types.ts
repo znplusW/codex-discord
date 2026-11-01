@@ -1,10 +1,19 @@
 export type SessionStatus = "online" | "offline" | "waiting" | "idle";
 
+export interface ModelPreferences {
+  model: string;
+  reasoningEffort: string | null;
+}
+
 export interface Project {
   channel_id: string;
   project_path: string;
   guild_id: string;
   auto_approve: number;
+  parent_channel_id: string | null;
+  chat_mode: "threads" | "channel";
+  conversation_state: "active" | "archived" | "deleted";
+  fixed_session?: number;
   created_at: string;
 }
 

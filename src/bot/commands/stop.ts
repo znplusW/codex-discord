@@ -18,7 +18,7 @@ export async function execute(
 
   if (!project) {
     await interaction.editReply({
-      content: L("This channel is not registered to any project.", "이 채널은 어떤 프로젝트에도 등록되어 있지 않습니다."),
+      content: "请在 CodeX 下的会话频道使用此命令。新建或打开会话请用 /sessions。",
     });
     return;
   }

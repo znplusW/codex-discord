@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
-import type { MessageCreateOptions, TextChannel } from "discord.js";
+import type { MessageCreateOptions } from "discord.js";
+import type { ConversationChannel } from "../bot/conversation-threads.js";
 import {
   upsertSession,
   updateSessionStatus,
   getProject,
   getSession,
+  getChannelModelPreferences,
+  getAllSessions,
   setAutoApprove,
 } from "../db/database.js";
 import { getConfig } from "../utils/config.js";
@@ -21,7 +24,7 @@ import {
 
 interface ActiveSession {
   channelId: string;
-  channel: TextChannel;
+  channel: ConversationChannel;
   threadId: string;
   turnId: string | null;
   dbId: string;
@@ -36,7 +39,7 @@ interface QuestionPayload {
 
 type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
 
-type StreamMessage = Awaited<ReturnType<TextChannel["send"]>>;
+type StreamMessage = Awaited<ReturnType<ConversationChannel["send"]>>;
 type StreamState = {
   buffer: string;
   messages: StreamMessage[];
@@ -71,16 +74,20 @@ const pendingCustomInputs = new Map<string, { requestId: number; questionId: str
 
 export class SessionManager {
   private sessions = new Map<string, ActiveSession>();
+  private starting = new Map<string, symbol>();
+  private exitingThreads = new Set<string>();
+  private threadOwners = new Map<string, string>();
   private initialized = false;
   private static readonly MAX_QUEUE_SIZE = 5;
-  private messageQueue = new Map<string, { channel: TextChannel; prompt: string }[]>();
-  private pendingQueuePrompts = new Map<string, { channel: TextChannel; prompt: string }>();
+  private messageQueue = new Map<string, { channel: ConversationChannel; prompt: string }[]>();
+  private pendingQueuePrompts = new Map<string, { channel: ConversationChannel; prompt: string }>();
   private streamState = new Map<string, StreamState>();
 
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) return;
 
     await codexAppServer.ensureStarted();
+    if (this.initialized) return; // Parallel first conversations share one listener set.
 
     codexAppServer.on("notification", (msg) => {
       this.handleNotification(msg as { method: string; params?: Record<string, unknown> }).catch((error) => {
@@ -104,22 +111,67 @@ export class SessionManager {
     this.initialized = true;
   }
 
-  async sendMessage(channel: TextChannel, prompt: string): Promise<void> {
+  async sendMessage(channel: ConversationChannel, prompt: string): Promise<void> {
+    const channelId = channel.id;
+    if (this.isActive(channelId)) {
+      await channel.send("⏳ 当前会话正在处理任务，请等待完成或加入队列。");
+      return;
+    }
+    // Reserve synchronously, before initialization or Discord/Codex I/O. Lifecycle
+    // commands must see a pending startup as active, even before a turn exists.
+    const token = Symbol(channelId);
+    this.starting.set(channelId, token);
+    try {
+      await this.startMessage(channel, prompt);
+    } catch (error) {
+      if (this.starting.get(channelId) === token) {
+        updateSessionStatus(channelId, "offline");
+        this.finishSession(channelId);
+      }
+      throw error;
+    } finally {
+      if (this.starting.get(channelId) === token) this.starting.delete(channelId);
+    }
+  }
+
+  private async startMessage(channel: ConversationChannel, prompt: string): Promise<void> {
     await this.ensureInitialized();
 
     const channelId = channel.id;
     const project = getProject(channelId);
     if (!project) return;
+    if (project.fixed_session) {
+      const { assertManagedConversationActive } = await import("../bot/managed-sync.js");
+      await assertManagedConversationActive(channelId);
+      if (!getSession(channelId)?.session_id) throw new Error("此频道会话绑定缺失，请用 /sessions 检查；未创建替代会话。");
+    }
 
     const existingSession = this.sessions.get(channelId);
     const dbSession = !existingSession ? getSession(channelId) : undefined;
     const dbId = existingSession?.dbId ?? dbSession?.id ?? randomUUID();
     let threadId = existingSession?.threadId ?? dbSession?.session_id ?? null;
 
+    if (threadId) {
+      const owner = this.threadOwners.get(threadId) ?? this.findActiveByThread(threadId)?.channelId;
+      if (owner && owner !== channelId) {
+        await channel.send(`⏳ 这个 Codex 会话正在 <#${owner}> 处理任务，请在那里继续，或等它完成后重试。`);
+        return;
+      }
+      // Reserve the Codex ID before resumeThread awaits; multiple Discord
+      // bindings may intentionally refer to the same historical conversation.
+      this.threadOwners.set(threadId, channelId);
+    }
+
     try {
       if (!threadId) {
-        const thread = await codexAppServer.startThread(project.project_path);
+        // Channel preferences are defaults only. Once a Codex thread exists,
+        // its own saved model/effort settings must survive resume and queuing.
+        const thread = await codexAppServer.startThread(
+          project.project_path,
+          getChannelModelPreferences(channelId),
+        );
         threadId = thread.id;
+        this.threadOwners.set(threadId, channelId);
       } else if (!existingSession) {
         await codexAppServer.resumeThread(threadId);
       }
@@ -131,7 +183,7 @@ export class SessionManager {
         await channel.send(
           `❌ ${L("Failed to resume the selected Codex session", "선택한 Codex 세션을 재개하지 못했습니다")}: ${message}\n` +
           L(
-            "Try `/sessions` again or choose `Create New Session`.",
+            "Retry in this conversation, or send a new task in the main channel to start a new conversation.",
             "`/sessions`를 다시 열거나 `새 세션 만들기`를 선택해 보세요."
           ),
         ).catch(() => {});
@@ -180,18 +232,21 @@ export class SessionManager {
       lastError: null,
     });
 
-    this.sessions.set(channelId, {
+    const activeSession: ActiveSession = {
       channelId,
       channel,
       threadId,
       turnId: null,
       dbId,
-    });
+    };
+    this.sessions.set(channelId, activeSession);
+    this.starting.delete(channelId); // sessions now protects the full turn lifetime.
 
     try {
       await codexAppServer.startTurn(threadId, prompt);
     } catch (error) {
-      await channel.send(`❌ ${error instanceof Error ? error.message : "Failed to start Codex turn"}`);
+      if (this.sessions.get(channelId) !== activeSession) return;
+      await channel.send(`❌ ${error instanceof Error ? error.message : "Failed to start Codex turn"}`).catch(() => {});
       updateSessionStatus(channelId, "offline");
       this.finishSession(channelId);
     }
@@ -202,11 +257,19 @@ export class SessionManager {
     const threadId = typeof params.threadId === "string" ? params.threadId : null;
     const active = threadId ? this.findActiveByThread(threadId) : undefined;
     if (!active) return;
+    if (threadId && this.exitingThreads.has(threadId)) return;
 
     const channelId = active.channelId;
     const stream = this.streamState.get(channelId);
 
     switch (msg.method) {
+      case "thread/closed": {
+        updateSessionStatus(channelId, "offline");
+        this.clearQueue(channelId);
+        this.finishSession(channelId);
+        await active.channel.send("Codex 运行连接已关闭。重新发送消息可尝试继续该会话。").catch(() => {});
+        return;
+      }
       case "turn/started": {
         const turn = params.turn as { id?: string } | undefined;
         if (turn?.id) {
@@ -348,12 +411,13 @@ export class SessionManager {
   }
 
   private async requestApproval(
-    channel: TextChannel,
+    channel: ConversationChannel,
     channelId: string,
     requestId: number,
     method: string,
     params: Record<string, unknown>,
   ): Promise<ApprovalDecision> {
+    const owner = this.sessions.get(channelId);
     const toolName =
       method === "item/fileChange/requestApproval"
         ? "FileChange"
@@ -376,11 +440,12 @@ export class SessionManager {
     const { embed, row } = createToolApprovalEmbed(toolName, input as Record<string, unknown>, String(requestId));
     updateSessionStatus(channelId, "waiting");
     await channel.send({ embeds: [embed], components: [row] });
+    if (this.sessions.get(channelId) !== owner) return "cancel";
 
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
         pendingApprovals.delete(requestId);
-        updateSessionStatus(channelId, "online");
+        if (this.sessions.get(channelId) === owner) updateSessionStatus(channelId, "online");
         resolve("cancel");
       }, 5 * 60 * 1000);
 
@@ -389,7 +454,7 @@ export class SessionManager {
         resolve: (decision) => {
           clearTimeout(timeout);
           pendingApprovals.delete(requestId);
-          updateSessionStatus(channelId, "online");
+          if (this.sessions.get(channelId) === owner) updateSessionStatus(channelId, "online");
           resolve(decision);
         },
       });
@@ -397,14 +462,16 @@ export class SessionManager {
   }
 
   private async askUserInput(
-    channel: TextChannel,
+    channel: ConversationChannel,
     channelId: string,
     requestId: number,
     questions: QuestionPayload[],
   ): Promise<Record<string, { answers: string[] }>> {
     const answers: Record<string, { answers: string[] }> = {};
+    const owner = this.sessions.get(channelId);
 
     for (let index = 0; index < questions.length; index++) {
+      if (this.sessions.get(channelId) !== owner) break;
       const question = questions[index];
       const { embed, components } = createAskUserQuestionEmbed(
         {
@@ -420,6 +487,7 @@ export class SessionManager {
 
       updateSessionStatus(channelId, "waiting");
       await channel.send({ embeds: [embed], components });
+      if (this.sessions.get(channelId) !== owner) break;
 
       const answer = await new Promise<Record<string, { answers: string[] }>>((resolve) => {
         const timeout = setTimeout(() => {
@@ -442,7 +510,7 @@ export class SessionManager {
       answers[question.id] = answer[question.id] ?? { answers: [] };
     }
 
-    updateSessionStatus(channelId, "online");
+    if (this.sessions.get(channelId) === owner) updateSessionStatus(channelId, "online");
     return answers;
   }
 
@@ -499,6 +567,29 @@ export class SessionManager {
     return true;
   }
 
+  async exitSession(channelId: string): Promise<{ threadId: string; cancelled: number } | null> {
+    const project = getProject(channelId);
+    const threadId = this.sessions.get(channelId)?.threadId ?? getSession(channelId)?.session_id;
+    if (!project || !threadId) return null;
+    const related = new Set([channelId, ...getAllSessions(project.guild_id)
+      .filter(session => session.session_id === threadId).map(session => session.channel_id)]);
+    const active = this.findActiveByThread(threadId);
+    if (active) related.add(active.channelId);
+    this.exitingThreads.add(threadId);
+    let cancelled = 0;
+    try {
+      // Clear before interruption: turn/completed must never start the next queued task.
+      for (const id of related) cancelled += this.clearQueue(id);
+      if (active?.turnId) await codexAppServer.interruptTurn(threadId, active.turnId).catch(() => {});
+      for (const id of related) {
+        this.finishSession(id);
+        updateSessionStatus(id, "offline");
+      }
+      await codexAppServer.releaseThread(threadId);
+      return { threadId, cancelled };
+    } finally { this.exitingThreads.delete(threadId); }
+  }
+
   private finishSession(channelId: string): void {
     const stream = this.streamState.get(channelId);
     if (stream) {
@@ -507,7 +598,17 @@ export class SessionManager {
     }
 
     this.sessions.delete(channelId);
+    this.starting.delete(channelId);
+    for (const [threadId, owner] of this.threadOwners) {
+      if (owner === channelId) this.threadOwners.delete(threadId);
+    }
     pendingCustomInputs.delete(channelId);
+    for (const approval of [...pendingApprovals.values()]) {
+      if (approval.channelId === channelId) approval.resolve("cancel");
+    }
+    for (const question of [...pendingQuestions.values()]) {
+      if (question.channelId === channelId) question.resolve({ [question.questionId]: { answers: [] } });
+    }
 
     const queue = this.messageQueue.get(channelId);
     if (queue && queue.length > 0) {
@@ -526,7 +627,12 @@ export class SessionManager {
   }
 
   isActive(channelId: string): boolean {
-    return this.sessions.has(channelId);
+    return this.sessions.has(channelId) || this.starting.has(channelId);
+  }
+
+  isThreadActive(threadId: string): boolean {
+    return this.threadOwners.has(threadId) || Boolean(this.findActiveByThread(threadId))
+      || [...this.starting.keys()].some((channelId) => getSession(channelId)?.session_id === threadId);
   }
 
   resolveApproval(requestId: string, decision: "approve" | "deny" | "approve-all"): boolean {
@@ -573,7 +679,7 @@ export class SessionManager {
     return pendingCustomInputs.has(channelId);
   }
 
-  setPendingQueue(channelId: string, channel: TextChannel, prompt: string): void {
+  setPendingQueue(channelId: string, channel: ConversationChannel, prompt: string): void {
     this.pendingQueuePrompts.set(channelId, { channel, prompt });
   }
 
@@ -604,7 +710,7 @@ export class SessionManager {
     return (this.messageQueue.get(channelId) ?? []).length;
   }
 
-  getQueue(channelId: string): { channel: TextChannel; prompt: string }[] {
+  getQueue(channelId: string): { channel: ConversationChannel; prompt: string }[] {
     return this.messageQueue.get(channelId) ?? [];
   }
 

@@ -19,7 +19,7 @@ export async function execute(
 
   if (!project) {
     await interaction.editReply({
-      content: L("This channel is not registered to any project. Use `/register` first.", "이 채널은 프로젝트에 등록되지 않았습니다. `/register`를 먼저 사용하세요."),
+      content: "请进入 CodeX 下的会话频道，或使用 /sessions 新建、打开会话。",
     });
     return;
   }
@@ -32,10 +32,10 @@ export async function execute(
     return;
   }
 
-  const thread = await codexAppServer.readThread(session.session_id, true);
+  const page = await codexAppServer.readRecentTurns(session.session_id, 20);
   let lastMessage = "";
 
-  for (const turn of thread.turns ?? []) {
+  for (const turn of page.turns) {
     for (const item of turn.items ?? []) {
       if (item.type === "agentMessage" && typeof item.text === "string" && item.text.trim()) {
         lastMessage = item.text.trim();

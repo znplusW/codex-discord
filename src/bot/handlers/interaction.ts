@@ -4,13 +4,26 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelType,
+  type TextChannel,
 } from "discord.js";
 import { isAllowedUser } from "../../security/guard.js";
 import { sessionManager } from "../../codex/session-manager.js";
-import { upsertSession, getSession } from "../../db/database.js";
+import { selectSession, getProject } from "../../db/database.js";
 import { codexAppServer } from "../../codex/app-server-client.js";
-import { deleteStoredThread } from "../../codex/storage.js";
+import { getStoredThread } from "../../codex/storage.js";
 import { L } from "../../utils/i18n.js";
+import { openConversationThread } from "../conversation-threads.js";
+import { withConversationLock } from "../conversation-lock.js";
+import { showMode } from "../commands/switch.js";
+import { handleConversationDeleteButton } from "../commands/conversation-lifecycle.js";
+import { handleModelPickerButton, handleModelPickerSelect } from "../commands/model-picker.js";
+import { importConversationHistory } from "../conversation-history.js";
+import { showSessions } from "../commands/sessions.js";
+import { getHub } from "../../db/channel-conversations.js";
+import { openConversationChannel } from "../conversation-channels.js";
+import { showNewSessionModal } from "../session-modal.js";
+import { handleBatchInteraction } from "../commands/batch-lifecycle.js";
 
 export async function handleButtonInteraction(
   interaction: ButtonInteraction,
@@ -23,6 +36,10 @@ export async function handleButtonInteraction(
     return;
   }
 
+  if (await handleModelPickerButton(interaction)) return;
+  if (await handleBatchInteraction(interaction)) return;
+  if (await handleConversationDeleteButton(interaction)) return;
+
   const customId = interaction.customId;
   const colonIndex = customId.indexOf(":");
   const action = colonIndex === -1 ? customId : customId.slice(0, colonIndex);
@@ -33,6 +50,18 @@ export async function handleButtonInteraction(
       content: L("Invalid button interaction.", "잘못된 버튼 상호작용입니다."),
       ephemeral: true,
     });
+    return;
+  }
+
+  if (action === "chat-mode" && (requestId === "threads" || requestId === "channel")) {
+    await interaction.deferUpdate();
+    await showMode(interaction, requestId);
+    return;
+  }
+
+  if (action === "session-page" && /^\d+$/.test(requestId)) {
+    await interaction.deferUpdate();
+    await showSessions(interaction, Number(requestId));
     return;
   }
 
@@ -78,24 +107,7 @@ export async function handleButtonInteraction(
   }
 
   if (action === "session-resume") {
-    const sessionId = requestId;
-    const channelId = interaction.channelId;
-    const { randomUUID } = await import("node:crypto");
-    upsertSession(randomUUID(), channelId, sessionId, "idle");
-
-    await interaction.update({
-      embeds: [
-        {
-          title: L("Session Selected", "세션 선택됨"),
-          description: L(
-            `Session: \`${sessionId.slice(0, 8)}...\`\n\nNext message you send will resume this Codex thread.`,
-            `세션: \`${sessionId.slice(0, 8)}...\`\n\n다음 메시지부터 이 Codex 스레드가 재개됩니다.`
-          ),
-          color: 0x00ff00,
-        },
-      ],
-      components: [],
-    });
+    await openSelectedConversation(interaction, requestId);
     return;
   }
 
@@ -222,35 +234,7 @@ export async function handleButtonInteraction(
   }
 
   if (action === "session-delete") {
-    const channelId = interaction.channelId;
-    const deleted = deleteStoredThread(requestId);
-    if (deleted) {
-      const dbSession = getSession(channelId);
-      if (dbSession?.session_id === requestId) {
-        const { randomUUID } = await import("node:crypto");
-        upsertSession(randomUUID(), channelId, null, "idle");
-      }
-
-      await interaction.update({
-        embeds: [
-          {
-            title: L("Session Deleted", "세션 삭제됨"),
-            description: L(
-              `Session \`${requestId.slice(0, 8)}...\` has been deleted.\nYour next message will start a new conversation.`,
-              `세션 \`${requestId.slice(0, 8)}...\`이(가) 삭제되었습니다.\n다음 메시지부터 새로운 대화가 시작됩니다.`
-            ),
-            color: 0xff6b6b,
-          },
-        ],
-        components: [],
-      });
-    } else {
-      await interaction.update({
-        content: L("Failed to delete session.", "세션 삭제에 실패했습니다."),
-        embeds: [],
-        components: [],
-      });
-    }
+    await interaction.reply({ content: "请先恢复并进入这个会话，再使用 `/delete`。删除前会显示确认按钮。", ephemeral: true });
     return;
   }
 
@@ -297,6 +281,9 @@ export async function handleSelectMenuInteraction(
     return;
   }
 
+  if (await handleModelPickerSelect(interaction)) return;
+  if (await handleBatchInteraction(interaction)) return;
+
   if (interaction.customId.startsWith("ask-select:")) {
     const askRequestId = interaction.customId.slice("ask-select:".length);
     const options = (interaction.component as any).options ?? [];
@@ -325,24 +312,26 @@ export async function handleSelectMenuInteraction(
   const selectedSessionId = interaction.values[0];
 
   if (selectedSessionId === "__new_session__") {
-    const channelId = interaction.channelId;
-    const { randomUUID } = await import("node:crypto");
-    upsertSession(randomUUID(), channelId, null, "idle");
+    if (interaction.guildId && getHub(interaction.guildId)) {
+      await showNewSessionModal(interaction);
+      return;
+    }
+    await openSelectedConversation(interaction, null);
+    return;
+  }
 
-    await interaction.update({
-      embeds: [
-        {
-          title: L("✨ New Session", "✨ 새 세션"),
-          description: L("New session is ready.\nA new conversation will start from your next message.", "새 세션이 준비되었습니다.\n다음 메시지부터 새로운 대화가 시작됩니다."),
-          color: 0x00ff00,
-        },
-      ],
-      components: [],
-    });
+  const project = getProject(interaction.channelId);
+  const parent = project?.parent_channel_id ? getProject(project.parent_channel_id) : project;
+  if ((interaction.guildId && getHub(interaction.guildId)) || project?.parent_channel_id || parent?.chat_mode === "threads") {
+    await openSelectedConversation(interaction, selectedSessionId);
     return;
   }
 
   await interaction.deferUpdate();
+  if (!project || getStoredThread(selectedSessionId)?.cwd !== project.project_path) {
+    await interaction.editReply({ content: "该会话已不存在，或不属于当前项目。请重新打开 `/sessions`。", embeds: [], components: [] });
+    return;
+  }
   const thread = await codexAppServer.readThread(selectedSessionId, true);
   let lastMessage = "";
   for (const turn of thread.turns ?? []) {
@@ -359,11 +348,6 @@ export async function handleSelectMenuInteraction(
       .setLabel(L("Resume", "재개"))
       .setStyle(ButtonStyle.Success)
       .setEmoji("▶️"),
-    new ButtonBuilder()
-      .setCustomId(`session-delete:${selectedSessionId}`)
-      .setLabel(L("Delete", "삭제"))
-      .setStyle(ButtonStyle.Danger)
-      .setEmoji("🗑️"),
     new ButtonBuilder()
       .setCustomId(`session-cancel:${selectedSessionId}`)
       .setLabel(L("Cancel", "취소"))
@@ -382,5 +366,68 @@ export async function handleSelectMenuInteraction(
       },
     ],
     components: [row],
+  });
+}
+
+async function openSelectedConversation(
+  interaction: ButtonInteraction | StringSelectMenuInteraction,
+  sessionId: string | null,
+): Promise<void> {
+  if (interaction.guildId && getHub(interaction.guildId)) {
+    await interaction.deferUpdate();
+    try {
+      if (!sessionId) throw new Error("请重新打开 /sessions 并选择创建新会话。");
+      const guild = await interaction.client.guilds.fetch(interaction.guildId);
+      const result = await openConversationChannel(guild, sessionId);
+      await interaction.editReply({ content: `${result.reused ? "已打开对应会话频道" : "会话频道已建立"}：<#${result.channel.id}>。直接在频道聊天即可继续原会话。${result.warning ? `\n${result.warning}` : ""}`,
+        embeds: [], components: [], allowedMentions: { parse: [] } });
+    } catch (error) {
+      await interaction.editReply({ content: `无法打开会话：${error instanceof Error ? error.message : String(error)}`, embeds: [], components: [], allowedMentions: { parse: [] } });
+    }
+    return;
+  }
+  const source = getProject(interaction.channelId);
+  const project = source?.parent_channel_id ? getProject(source.parent_channel_id) : source;
+  if (!project) {
+    await interaction.reply({
+      content: "请在已注册的频道或对应子区使用此菜单。",
+      ephemeral: true,
+    });
+    return;
+  }
+  await interaction.deferUpdate();
+  await withConversationLock(project.channel_id, async () => {
+    const channelMode = !source?.parent_channel_id && getProject(project.channel_id)?.chat_mode === "channel";
+    if (channelMode && (sessionManager.isActive(project.channel_id) || sessionManager.hasQueue(project.channel_id) || sessionManager.getQueueSize(project.channel_id) > 0)) {
+      await interaction.editReply({ content: "当前会话仍有任务运行或排队，请完成或取消后再切换会话。", embeds: [], components: [] });
+      return;
+    }
+    const stored = sessionId ? getStoredThread(sessionId) : null;
+    if (sessionId && (!stored || !stored.cwd || stored.archived || (channelMode && stored.cwd !== project.project_path))) {
+      await interaction.editReply({ content: "该会话已不存在，或不属于当前项目。请重新打开 `/sessions`。", embeds: [], components: [] });
+      return;
+    }
+    if (channelMode) {
+      selectSession(project.channel_id, sessionId);
+      await interaction.editReply({ content: sessionId
+        ? "已切换当前会话。直接在本频道发送消息即可继续。"
+        : "已准备新会话。直接在本频道发送消息即可开始。", embeds: [], components: [] });
+      return;
+    }
+    try {
+      const channel = interaction.channelId === project.channel_id
+        ? interaction.channel : await interaction.client.channels.fetch(project.channel_id);
+      if (!channel || channel.type !== ChannelType.GuildText) throw new Error("无法访问对应主频道。");
+      if (sessionId) {
+        const result = await importConversationHistory(channel as TextChannel, interaction.user.id, sessionId);
+        await interaction.editReply({ content: `${result.reused ? "已打开原会话子区" : "会话入口已创建"}：<#${result.thread.id}>。${result.synced ? `已同步 ${result.synced} 段最近对话。` : ""}\n${result.warning ?? result.notice ?? "进入子区发消息即可继续原 Codex 会话。"}`, embeds: [], components: [], allowedMentions: { parse: [] } });
+      } else {
+        const starter = await (channel as TextChannel).send({ content: "**Codex 新会话**\n进入此消息的子区发送第一条任务。", allowedMentions: { parse: [] } });
+        const thread = await openConversationThread(starter, interaction.user.id, "Codex 新会话");
+        await interaction.editReply({ content: `新会话已就绪：<#${thread.id}>。进入子区发送任务即可开始。`, embeds: [], components: [] });
+      }
+    } catch (error) {
+      await interaction.editReply({ content: `无法打开会话：${error instanceof Error ? error.message : "请稍后重试。"}`, embeds: [], components: [], allowedMentions: { parse: [] } });
+    }
   });
 }

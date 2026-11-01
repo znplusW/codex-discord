@@ -1,5 +1,7 @@
-import { Message, TextChannel, Attachment, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
-import { getProject } from "../../db/database.js";
+import { Message, ChannelType, Attachment, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
+import { getProject, getSession } from "../../db/database.js";
+import { openConversationThread, type ConversationChannel } from "../conversation-threads.js";
+import { withConversationLock } from "../conversation-lock.js";
 import { isAllowedUser, checkRateLimit } from "../../security/guard.js";
 import { sessionManager } from "../../codex/session-manager.js";
 import fs from "node:fs";
@@ -7,6 +9,8 @@ import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { L } from "../../utils/i18n.js";
+import { getHub, getManagedConversation } from "../../db/channel-conversations.js";
+import { openConversationChannel } from "../conversation-channels.js";
 
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
 const BLOCKED_EXTENSIONS = new Set([
@@ -56,10 +60,12 @@ async function downloadAttachment(
 }
 
 export async function handleMessage(message: Message): Promise<void> {
-  if (message.author.bot || !message.guild) return;
+  if (message.author.bot || message.system || !message.guild) return;
 
-  const project = getProject(message.channelId);
-  if (!project) return;
+  const isThread = message.channel.isThread();
+  const parentId = isThread ? message.channel.parentId : message.channelId;
+  if (!parentId || !getProject(parentId)) return;
+  if (!isThread && message.channel.type !== ChannelType.GuildText) return;
 
   if (!isAllowedUser(message.author.id)) {
     await message.reply(L("You are not authorized to use this bot.", "이 봇을 사용할 권한이 없습니다."));
@@ -70,6 +76,38 @@ export async function handleMessage(message: Message): Promise<void> {
     await message.reply(L("Rate limit exceeded. Please wait a moment.", "요청 한도를 초과했습니다. 잠시 후 다시 시도하세요."));
     return;
   }
+
+  // A root message becomes a thread with the same ID. Serialize its initial
+  // prompt and quick follow-ups while keeping different conversations parallel.
+  const key = isThread || getProject(parentId)?.chat_mode === "channel" ? message.channelId : message.id;
+  await withConversationLock(key, () => processMessage(message));
+}
+
+async function processMessage(message: Message): Promise<void> {
+  const project = getProject(message.channelId);
+  if (!project) return; // Ignore unrelated, manually-created threads.
+  const isThread = message.channel.isThread();
+  if (getHub(message.guild!.id) && !project.fixed_session) {
+    const sessionId = getSession(message.channelId)?.session_id;
+    let target = sessionId ? getManagedConversation(message.guild!.id, sessionId)?.channel_id : null;
+    if (sessionId && !target) {
+      try { target = (await openConversationChannel(message.guild!, sessionId)).channel.id; }
+      catch { /* Archived/deleted legacy chats are not silently restored. */ }
+    }
+    await message.reply({ content: target ? `此会话已迁移，请进入 <#${target}> 继续聊天。`
+      : "会话现在使用 CodeX 下的独立频道。请使用 /sessions 新建或打开会话。", allowedMentions: { parse: [] } });
+    return;
+  }
+  if (isThread && project.parent_channel_id !== message.channel.parentId) return;
+  if ((isThread || project.fixed_session) && project.conversation_state !== "active") {
+    await message.reply(project.conversation_state === "archived"
+      ? "这个会话已归档。可用 `/restore` 恢复后继续。"
+      : "这个会话已删除。请回到主频道新建会话。");
+    return;
+  }
+  const createThread = !isThread && project.chat_mode === "threads";
+  // A replayed root event must not submit the initial task a second time.
+  if (createThread && getSession(message.id)?.session_id) return;
 
   if (sessionManager.hasPendingCustomInput(message.channelId)) {
     const text = message.content.trim();
@@ -112,28 +150,31 @@ export async function handleMessage(message: Message): Promise<void> {
 
   if (!prompt) return;
 
-  const channel = message.channel as TextChannel;
+  const channel: ConversationChannel = createThread
+    ? await openConversationThread(message, message.author.id, message.content || message.attachments.first()?.name || "Codex 新会话")
+    : message.channel as ConversationChannel;
+  const channelId = channel.id;
 
-  if (sessionManager.isActive(message.channelId)) {
-    if (sessionManager.hasQueue(message.channelId)) {
+  if (sessionManager.isActive(channelId)) {
+    if (sessionManager.hasQueue(channelId)) {
       await message.reply(L("⏳ A message is already waiting to be queued. Please press the button first.", "⏳ 이미 큐 추가 대기 중인 메시지가 있습니다. 버튼을 먼저 눌러주세요."));
       return;
     }
-    if (sessionManager.isQueueFull(message.channelId)) {
+    if (sessionManager.isQueueFull(channelId)) {
       await message.reply(L("⏳ Queue is full (max 5). Please wait for the current task to finish.", "⏳ 큐가 가득 찼습니다 (최대 5개). 현재 작업 완료를 기다려주세요."));
       return;
     }
 
-    sessionManager.setPendingQueue(message.channelId, channel, prompt);
+    sessionManager.setPendingQueue(channelId, channel, prompt);
 
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(`queue-yes:${message.channelId}`)
+        .setCustomId(`queue-yes:${channelId}`)
         .setLabel(L("Add to Queue", "큐에 추가"))
         .setStyle(ButtonStyle.Success)
         .setEmoji("✅"),
       new ButtonBuilder()
-        .setCustomId(`queue-no:${message.channelId}`)
+        .setCustomId(`queue-no:${channelId}`)
         .setLabel(L("Cancel", "취소"))
         .setStyle(ButtonStyle.Secondary)
         .setEmoji("❌"),

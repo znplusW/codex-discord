@@ -12,6 +12,7 @@ export interface StoredCodexThread {
   model_provider: string;
   cwd: string;
   title: string;
+  archived?: number;
 }
 
 function getCodexHome(): string {
@@ -43,19 +44,23 @@ function openStateDb(readonly = true): Database.Database | null {
   return new Database(dbPath, readonly ? { readonly: true } : undefined);
 }
 
-export function listStoredThreads(projectPath: string): StoredCodexThread[] {
+function titleProjection(db: Database.Database): string {
+  const hasName = (db.pragma("table_info(threads)") as { name: string }[]).some(c => c.name === "name");
+  return hasName ? "COALESCE(NULLIF(name,''),title) AS title" : "title";
+}
+
+export function listStoredThreads(projectPath?: string): StoredCodexThread[] {
   const db = openStateDb(true);
   if (!db) return [];
 
   try {
-    return db
-      .prepare(`
-        SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd, title
+    const statement = db.prepare(`
+        SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd, ${titleProjection(db)}, archived
         FROM threads
-        WHERE cwd = ? AND archived = 0
+        WHERE ${projectPath === undefined ? "" : "cwd = ? AND "}archived = 0
         ORDER BY updated_at DESC
-      `)
-      .all(projectPath) as StoredCodexThread[];
+      `);
+    return (projectPath === undefined ? statement.all() : statement.all(projectPath)) as StoredCodexThread[];
   } finally {
     db.close();
   }
@@ -68,7 +73,7 @@ export function getStoredThread(threadId: string): StoredCodexThread | undefined
   try {
     return db
       .prepare(`
-        SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd, title
+        SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd, ${titleProjection(db)}, archived
         FROM threads
         WHERE id = ?
       `)

@@ -1,431 +1,144 @@
-# Codex Discord Setup Guide
+# Setup guide
 
-Complete setup guide for running `codex-discord` on macOS, Linux, or Windows.
+**English** | [简体中文](SETUP.zh-CN.md) | [Project overview](README.md)
 
-> **[한국어 문서](docs/SETUP.kr.md)** | **[README](README.md)**
+This guide installs the channel-per-conversation fork on a machine that already has access to the working directories you want Codex to use.
 
-This guide covers:
+## 1. Prepare Codex and Node.js
 
-- local Codex login
-- Discord bot creation
-- `.env` configuration
-- background launchers for each OS
-- first-run checks and common failure cases
-
-## 1. Prerequisites
-
-You need these on the machine that will run the bot:
-
-- Node.js 20 or newer
-- Codex CLI installed locally
-- a completed `codex login`
-- a Discord server where you can add a bot
-
-Verify the basics:
+Install Node.js 20 or newer and the Codex CLI, then sign in:
 
 ```bash
-node -v
+node --version
 codex --version
+codex login
 codex login status
 ```
 
-On Windows PowerShell, `codex` may resolve to `codex.ps1`, which can be blocked by execution policy. If that happens, verify the CLI with:
+The bot uses this local Codex login. Do not add an OpenAI API key to `.env` for the normal setup.
 
-```powershell
-codex.cmd --version
-codex.cmd login status
-```
+## 2. Create a Discord application
 
-If `codex login status` does not show a logged-in account, complete login first:
+1. Open <https://discord.com/developers/applications> and create an application.
+2. Open **Bot**, create the bot user, and copy its token.
+3. Enable **Message Content Intent** and save.
+4. Open **OAuth2 → URL Generator**.
+5. Select the scopes `bot` and `applications.commands`.
+6. Grant: View Channels, Send Messages, Read Message History, Embed Links, Attach Files, Use Application Commands, Manage Channels, and Manage Threads.
+7. Open the generated URL and add the bot to your server.
+
+Administrator and Manage Roles are not required. The bot creates private conversation categories and preserves each channel's permission overwrites when moving it between active, archived, and deleted categories.
+
+## 3. Copy Discord IDs
+
+Enable **Discord Settings → Advanced → Developer Mode**. Copy:
+
+- the server ID for `DISCORD_GUILD_ID`;
+- your user ID for `ALLOWED_USER_IDS`.
+
+Multiple allowed users can be separated with commas. Everyone who is not in this list is rejected even if Discord permissions let them see a channel.
+
+## 4. Install
+
+### Release asset
+
+Download and extract a `.zip` or `.tar.gz` from [Releases](https://github.com/znplusW/codex-discord/releases), then run:
 
 ```bash
-codex login
+./install-release.sh
 ```
 
-This project uses your local Codex login session. You do not need to paste an OpenAI API key into `.env`.
-If you previously used an API-key-based workflow elsewhere, leave that out here unless you intentionally want `codex login --with-api-key`.
+The release contains prebuilt JavaScript. The installer verifies Node/Codex, installs production dependencies, and creates `.env` from the example without overwriting an existing `.env`.
 
-## 2. Install the Project
-
-### Recommended: installer script
+### Source checkout
 
 ```bash
-git clone https://github.com/chadingTV/codex-discord.git
+git clone https://github.com/znplusW/codex-discord.git
 cd codex-discord
 ./install.sh
 ```
 
-Windows:
-
-```bat
-git clone https://github.com/chadingTV/codex-discord.git
-cd codex-discord
-install.bat
-```
-
-The install scripts:
-
-- check Node.js
-- install the Codex CLI if missing
-- run `npm install`
-- build the project
-- start the platform launcher when possible
-
-### Manual install
-
-```bash
-git clone https://github.com/chadingTV/codex-discord.git
-cd codex-discord
-npm install
-npm run build
-```
-
-## 3. Create the Discord Bot
-
-### 3.1 Create an application
-
-1. Open <https://discord.com/developers/applications>
-2. Click `New Application`
-3. Give it a name like `My Codex Code`
-
-### 3.2 Create a bot user
-
-1. Open the `Bot` tab
-2. Create the bot if Discord has not created one automatically
-3. Copy the bot token
-
-This becomes:
-
-```env
-DISCORD_BOT_TOKEN=...
-```
-
-### 3.3 Enable Message Content Intent
-
-In the same `Bot` settings page:
-
-- enable `MESSAGE CONTENT INTENT`
-- save changes
-
-Without this, the bot can register slash commands but will not respond to normal chat messages.
-
-### 3.4 Invite the bot to your server
-
-In `OAuth2 -> URL Generator`:
-
-- Scopes:
-  - `bot`
-  - `applications.commands`
-- Bot permissions:
-  - `Send Messages`
-  - `Embed Links`
-  - `Read Message History`
-  - `Use Slash Commands`
-  - `Attach Files`
-
-<p align="center">
-  <img src="docs/discord-scopes.png" alt="Discord OAuth2 scopes" width="520">
-</p>
-
-<p align="center">
-  <img src="docs/discord-bot-permissions.png" alt="Discord bot permissions" width="520">
-</p>
-
-Open the generated URL in your browser and invite the bot to your target server.
-
-## 4. Get Discord IDs
-
-Enable Discord Developer Mode first:
-
-- Discord `Settings -> Advanced -> Developer Mode`
-
-Then collect:
-
-- `DISCORD_GUILD_ID`
-  - right-click the server name and copy server ID
-- `ALLOWED_USER_IDS`
-  - right-click your user and copy user ID
-  - you can provide multiple IDs separated by commas
-
-<p align="center">
-  <img src="docs/copy-server-id-en.png" alt="Copy Discord server ID" width="420">
-</p>
-
-<p align="center">
-  <img src="docs/copy-user-id-en.png" alt="Copy Discord user ID" width="420">
-</p>
-
-Example:
-
-```env
-DISCORD_GUILD_ID=123456789012345678
-ALLOWED_USER_IDS=111111111111111111,222222222222222222
-```
-
 ## 5. Configure `.env`
-
-Create the file:
-
-```bash
-cp .env.example .env
-```
-
-Fill it in:
 
 ```env
 DISCORD_BOT_TOKEN=your_bot_token
-DISCORD_GUILD_ID=your_server_id
-ALLOWED_USER_IDS=your_user_id
-BASE_PROJECT_DIR=/Users/you/projects
+DISCORD_GUILD_ID=123456789012345678
+ALLOWED_USER_IDS=111111111111111111
+BASE_PROJECT_DIR=/absolute/path/for/new_conversations
 RATE_LIMIT_PER_MINUTE=10
 SHOW_COST=false
 ```
 
-### Variable reference
+`BASE_PROJECT_DIR` is the working directory used for conversations created from Discord. Conversations imported with `/sessions` keep their original working directory. Use an absolute path that the local account running the bot can access.
 
-| Variable | Meaning |
-|---|---|
-| `DISCORD_BOT_TOKEN` | Bot token from Discord Developer Portal |
-| `DISCORD_GUILD_ID` | Discord server ID |
-| `ALLOWED_USER_IDS` | Comma-separated list of users allowed to control the bot |
-| `BASE_PROJECT_DIR` | Root directory the bot is allowed to register projects under |
-| `RATE_LIMIT_PER_MINUTE` | Per-user Discord prompt limit |
-| `SHOW_COST` | Controls the result footer; Codex login-based runs do not currently report real turn cost here |
+Never commit `.env`. The repository and release builder exclude tokens, databases, logs, uploads, and local runtime files.
 
-There is no required `OPENAI_API_KEY` variable for this project's normal setup.
+## 6. Start
 
-### Choosing `BASE_PROJECT_DIR`
+For a foreground check:
 
-Pick a parent folder that contains the projects you want to control.
+```bash
+npm start
+```
 
-Examples:
-
-- macOS: `/Users/you/work`
-- Linux: `/home/you/projects`
-- Windows: `C:\Users\you\projects`
-
-When you later run `/register api-server`, the bot resolves it under that base directory.
-Nested paths are supported too, so `/register apps/api-server` can be selected from autocomplete as well.
-
-Quick example:
-
-- `BASE_PROJECT_DIR=/Users/you/projects`
-- `/register api-server`
-- resolved path: `/Users/you/projects/api-server`
-
-## 6. Start the Bot
-
-### macOS
+On macOS:
 
 ```bash
 ./mac-start.sh
-```
-
-Useful commands:
-
-```bash
 ./mac-start.sh --status
-./mac-start.sh --stop
-./mac-start.sh --fg
-tail -f bot.log
 ```
 
-Behavior:
-
-- background bot via `launchd`
-- native menu bar companion app
-- foreground mode for debugging
-
-First macOS run may require:
-
-- Xcode Command Line Tools
-- accepted Xcode license for compiling the Swift menu bar app
-
-### Linux
+On Linux:
 
 ```bash
 ./linux-start.sh
+./linux-start.sh --status
 ```
 
-Useful commands:
+The first successful startup registers 16 commands and creates a private `CodeX` category plus the default `#助理` channel. Send a normal message in the channel to test the connection.
+
+## 7. Recommended first checks
+
+1. Run `/status` and confirm the default conversation appears.
+2. Send `Reply only: connected` in `#助理`.
+3. Run `/sessions`, create a named conversation, and confirm a same-name channel appears.
+4. Run `/model` without parameters and confirm the model and reasoning menus appear.
+5. Run `/exit` in a finished test conversation before opening the same conversation in another local client.
+
+## 8. Updating
+
+Back up `.env` and `data.db` before replacing an installation. A release upgrade should preserve those two local files while replacing source/build files and reinstalling dependencies:
 
 ```bash
-./linux-start.sh --status
-./linux-start.sh --stop
-./linux-start.sh --fg
-tail -f bot.log
+npm ci --omit=dev
 ```
 
-Behavior:
+Restart the platform service after the replacement. Database migrations run automatically on startup.
 
-- `systemd --user` service for the bot
-- tray app if a desktop session is available
-- tray menu can open a separate control panel with status, usage, and bot actions
-- headless-friendly if no GUI is present
-
-### Windows
-
-```bat
-win-start.bat
-```
-
-Useful commands:
-
-```bat
-win-start.bat --status
-win-start.bat --stop
-win-start.bat --fg
-type bot.log
-```
-
-Behavior:
-
-- background start script
-- tray companion app when available
-- foreground mode for debugging
-- the tray panel shows bot status, controls, and cached Codex usage
-- the launcher auto-detects a working Codex command on Windows and caches it in `~/.codex/codex-discord-runtime.json`
-
-## 7. First Discord Test
-
-1. Open a channel in the server where the bot was invited.
-2. Run:
-
-```text
-/register
-```
-
-3. Choose a folder under `BASE_PROJECT_DIR`.
-   You can pick a nested path like `apps/api-server` as well.
-4. Send a normal message like:
-
-```text
-analyze this project
-```
-
-5. Confirm the bot replies and, if needed, shows approval buttons.
-
-Recommended follow-up checks:
-
-- `/status`
-- `/sessions`
-- `/last`
-- `/usage`
-
-## 8. How Session Discovery Works
-
-`/sessions` does not only list sessions started by the Discord bot.
-
-It also reads local Codex thread metadata from:
-
-- `~/.codex/state_*.sqlite`
-- rollout paths tracked in that state DB
-
-Threads are filtered by project path (`cwd`), so if you used VS Code Codex in the same project folder, that thread can appear in Discord.
-
-## 9. Attachments and Local Files
-
-When a user uploads files:
-
-- they are saved under `<project>/.codex-uploads/`
-- image files are passed to Codex as local image paths
-- other allowed files are passed as local file references
-- blocked executable types are rejected
-- the size limit is 25 MB per file
-
-If you want to clean these up periodically, you should add your own housekeeping policy.
-
-## 10. Operating Model
-
-The safest workflow is:
-
-- one Discord bot instance per machine
-- one registered project per Discord channel
-- one active Codex turn per channel at a time
-
-While a turn is active:
-
-- the bot shows a stop button
-- additional prompts can be queued
-- approval prompts can be accepted, denied, or auto-approved for the session
-
-## 11. Troubleshooting
-
-### Bot does not answer normal messages
-
-Check:
-
-- `MESSAGE CONTENT INTENT` is enabled in Discord Developer Portal
-- your ID is listed in `ALLOWED_USER_IDS`
-- the channel has been registered with `/register`
-- the bot process is actually running
+## 9. Troubleshooting
 
 ### Slash commands do not appear
 
-Check:
+- Confirm the bot was invited with `applications.commands`.
+- Confirm `DISCORD_GUILD_ID` is the intended server.
+- Restart the bot and check for `Registered 16 slash commands` in the log.
+- Fully restart the Discord mobile app if it still caches an old command list.
 
-- the bot was invited with `applications.commands`
-- you are looking in the correct server
-- the bot has started successfully
+### Normal messages get no response
 
-### `codex` works in terminal but bot fails
+- Enable Message Content Intent in the Discord developer portal.
+- Check that your user ID is in `ALLOWED_USER_IDS`.
+- Use a managed conversation channel under `CodeX`.
+- Confirm the machine remains logged in, awake, online, and signed in to Codex.
 
-Check:
+### Channel creation or moves fail
 
-- `codex login status`
-- on Windows PowerShell, also try `codex.cmd login status`
-- the bot is running on the same machine and account that has the Codex login
-- the background launcher can find `node`
-- you did not set up the project expecting an `.env` API key flow
+Grant Manage Channels. The bot does not need Administrator or Manage Roles. Manage Threads is used for migration and retained thread flows.
 
-Windows note:
+### Archive/delete reports an active writer
 
-- PowerShell may pick `codex.ps1` first, while the bot and tray work better with `codex.cmd`
-- the Windows launcher caches the detected command in `~/.codex/codex-discord-runtime.json`
-- cached usage data is stored in `~/.codex/rate-limits-cache.json`
+Another Codex application still owns that conversation. `/exit` releases only this bot's writer. Exit the application that owns the conversation; the confirmed lifecycle request remains pending and retries in the background. Discord state is changed only after Codex state is verified.
 
-Foreground mode is the fastest way to debug:
+### Imported history is incomplete
 
-```bash
-./mac-start.sh --fg
-./linux-start.sh --fg
-win-start.bat --fg
-```
-
-### `/sessions` shows nothing
-
-Possible reasons:
-
-- no prior Codex thread exists for that project path
-- your VS Code Codex thread used a different working directory
-- `~/.codex` has no readable state database yet
-
-### The bot stopped responding after working once
-
-Check:
-
-- `bot.log`
-- `bot-error.log`
-- launcher status command for your platform
-
-If needed, stop and start again.
-
-## 12. Development Checks
-
-```bash
-npm run build
-npm test
-```
-
-Type-check only:
-
-```bash
-./node_modules/.bin/tsc --noEmit
-```
-
-## 13. Notes for Real-World Use
-
-- Avoid controlling the exact same thread from Discord and VS Code at the same moment.
-- Keep your bot token private.
-- Restrict `ALLOWED_USER_IDS` aggressively.
-- Use a narrow `BASE_PROJECT_DIR`, not your home directory root.
+The first import includes up to 20 recent visible rounds. Run `/sync history` for each earlier page. Internal reasoning and tool logs are intentionally excluded.

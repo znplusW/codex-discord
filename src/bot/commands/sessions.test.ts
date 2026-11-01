@@ -13,7 +13,10 @@ import {
   getLastAssistantMessage,
   getLastAssistantMessageFull,
   listSessions,
+  execute,
+  showSessions,
 } from "./sessions.js";
+import { getDb, initDatabase, registerProject,setChatMode } from "../../db/database.js";
 
 describe("sessions helpers", () => {
   beforeEach(() => {
@@ -93,5 +96,41 @@ describe("sessions helpers", () => {
         source: "vscode",
       },
     ]);
+  });
+
+  it("renders real Discord menu builders with long metadata and excludes internal agent chats",async()=>{
+    initDatabase(":memory:");registerProject("root","/project","guild");
+    try {
+      vi.mocked(listStoredThreads).mockReturnValue([
+        {id:"main",title:"😀".repeat(80),source:JSON.stringify({external:"source".repeat(80)}),updated_at:1700000000},
+        {id:"internal",title:"internal",source:JSON.stringify({subagent:{thread_spawn:{agent_path:"/root/helper",extra:"long".repeat(80)}}}),updated_at:1700000001},
+      ] as any);
+      const i={channelId:"root",editReply:vi.fn()} as any;
+      await execute(i);
+      const menu=i.editReply.mock.calls[0][0].components[0].toJSON().components[0];
+      expect(menu.options.map((o:any)=>o.value)).toEqual(["__new_session__","main"]);
+      expect(menu.options[1].label.length).toBeLessThanOrEqual(100);
+      expect(menu.options[1].label.endsWith("😀")).toBe(true);
+      expect(menu.options[1].description.length).toBeLessThanOrEqual(100);
+      expect(menu.options[1].description).toContain("Codex 会话");
+      expect(menu.options[1].description).not.toContain("external");
+    } finally {getDb().close();}
+  });
+
+  it("browses all desktop projects with pages in thread mode while channel mode remains project-scoped",async()=>{
+    initDatabase(":memory:");registerProject("root","/project","guild");
+    try {
+      vi.mocked(listStoredThreads).mockReturnValue(Array.from({length:39},(_,i)=>({id:`session-${i}`,title:`桌面会话 ${i}`,source:"vscode",updated_at:1700000000-i,cwd:`/project-${i}`})) as any);
+      const i={channelId:"root",editReply:vi.fn()} as any;
+      await showSessions(i,1);
+      expect(listStoredThreads).toHaveBeenLastCalledWith(undefined);
+      const payload=i.editReply.mock.calls[0][0];
+      expect(payload.embeds[0].title).toContain("2/2");
+      expect(payload.components[0].toJSON().components[0].options[1].value).toBe("session-24");
+      expect(payload.components[0].toJSON().components[0].options).toHaveLength(16);
+      expect(payload.components[1].toJSON().components[0].custom_id).toBe("session-page:0");
+      setChatMode("root","channel");await showSessions(i);
+      expect(listStoredThreads).toHaveBeenLastCalledWith("/project");
+    } finally {getDb().close();}
   });
 });

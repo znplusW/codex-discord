@@ -1,6 +1,6 @@
 {
   "name": "codex-discord-controller",
-  "version": "0.2.0-channel.1",
+  "version": "0.2.0-channel.2",
   "description": "Control local Codex conversations through one permanently bound Discord channel per conversation",
   "type": "module",
   "main": "dist/index.js",

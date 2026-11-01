@@ -1,4 +1,8 @@
-# v0.2.0-channel.1
+# v0.2.0-channel.2
+
+This patch release fixes the downloadable checksum manifest so it can be verified directly from the directory containing the release assets. The application functionality is unchanged from `v0.2.0-channel.1`.
+
+此补丁版本修复了下载包的校验清单；将三个 Release 文件放在同一目录后即可直接运行校验。应用功能与 `v0.2.0-channel.1` 相同。
 
 [English](#english) | [简体中文](#简体中文)
 

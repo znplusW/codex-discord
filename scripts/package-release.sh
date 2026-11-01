@@ -24,5 +24,8 @@ tar -czf "$OUTPUT_DIR/$ROOT_NAME.tar.gz" -C "$STAGE" "$ROOT_NAME"
   zip -qr "$OLDPWD/$OUTPUT_DIR/$ROOT_NAME.zip" "$ROOT_NAME"
 )
 
-shasum -a 256 "$OUTPUT_DIR/$ROOT_NAME.tar.gz" "$OUTPUT_DIR/$ROOT_NAME.zip" > "$OUTPUT_DIR/SHA256SUMS.txt"
+(
+  cd "$OUTPUT_DIR"
+  shasum -a 256 "$ROOT_NAME.tar.gz" "$ROOT_NAME.zip" > SHA256SUMS.txt
+)
 echo "Created release assets in $OUTPUT_DIR"

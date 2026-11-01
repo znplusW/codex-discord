@@ -8,7 +8,9 @@ OUTPUT_DIR="${2:-release}"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
-npm ci
+if [ ! -d node_modules ]; then
+  NPM_CONFIG_CACHE="${TMPDIR:-/tmp}/codex-discord-build-cache" npm ci
+fi
 npm test
 npm run build
 

@@ -25,7 +25,7 @@ if [ ! -f dist/index.js ]; then
 fi
 
 echo "Installing production dependencies..."
-npm ci --omit=dev
+NPM_CONFIG_CACHE="${TMPDIR:-/tmp}/codex-discord-npm-cache" npm ci --omit=dev
 
 if [ ! -f .env ]; then
   cp .env.example .env
